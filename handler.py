@@ -126,9 +126,14 @@ def _load_pipeline():
         torch_dtype=torch.bfloat16,
     )
 
-    # Always use CPU offload — model is too large for even 48GB GPUs during generation
-    pipe.enable_model_cpu_offload()
-    log.info("CPU offload enabled (%.1f GB VRAM available)", vram_gb)
+    # 80GB GPUs (A100): load fully to GPU for maximum speed
+    # 48GB GPUs (A6000): need CPU offload to avoid OOM
+    if vram_gb >= 70:
+        pipe = pipe.to("cuda")
+        log.info("Full GPU mode (%.1f GB VRAM — no offload needed)", vram_gb)
+    else:
+        pipe.enable_model_cpu_offload()
+        log.info("CPU offload enabled (%.1f GB VRAM — tight fit)", vram_gb)
 
     # Enable VAE tiling to reduce peak VRAM during decode
     pipe.vae.enable_tiling()
