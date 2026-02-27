@@ -1,0 +1,11 @@
+runpod>=1.7.0
+torch>=2.4.0
+torchvision>=0.19.0
+diffusers>=0.36.0
+transformers
+accelerate
+safetensors
+sentencepiece
+Pillow
+imageio[ffmpeg]
+huggingface_hub
