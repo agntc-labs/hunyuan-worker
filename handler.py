@@ -1,11 +1,11 @@
 """RunPod Serverless HunyuanVideo 1.5 i2v Worker — image-to-video generation on CUDA.
 
 Pure Diffusers pipeline (same pattern as agntc-labs/sdxl-worker):
-  - HunyuanVideo-1.5-Diffusers-720p_i2v (8.3B params, FP16)
+  - HunyuanVideo-1.5-Diffusers-720p_i2v (8.3B params, BF16)
   - SigLIP vision encoder for image conditioning
   - Qwen2.5-VL-7B + ByT5 text encoders
-  - FlowMatch Euler scheduler
-  - Optional CPU offload for 24GB GPUs
+  - FlowMatch Euler scheduler with ClassifierFreeGuidance guider
+  - CPU offload + VAE tiling for VRAM efficiency
 
 Input schema:
   {
@@ -14,7 +14,7 @@ Input schema:
       "image_b64": str,                 # Base64-encoded source image (PNG/JPEG)
       "num_frames": int (default 121),  # 61=~2.5s, 121=~5s, 193=~8s at 24fps
       "num_inference_steps": int (default 30),  # 30-50 recommended
-      "guidance_scale": float (default 6.0),
+      "guidance_scale": float (default 6.0),   # Applied via guider, not pipe kwarg
       "seed": int | null,              # Random if null
       "width": int (default 1280),     # Output width
       "height": int (default 720),     # Output height
@@ -110,7 +110,7 @@ def _load_pipeline():
     _Image = Image
 
     t0 = time.time()
-    log.info("Loading HunyuanVideo 1.5 i2v pipeline (CUDA)...")
+    log.info("Loading HunyuanVideo 1.5 i2v pipeline...")
 
     # Detect available VRAM
     if torch.cuda.is_available():
@@ -120,31 +120,28 @@ def _load_pipeline():
         vram_gb = 0
         log.error("No CUDA GPU detected!")
 
+    # Load model in bfloat16 (more numerically stable than float16 for this model)
     pipe = HunyuanVideo15ImageToVideoPipeline.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
     )
 
-    # Memory strategy based on available VRAM
-    if vram_gb >= 40:
-        # A6000/A100/H100 — keep everything on GPU
-        pipe = pipe.to("cuda")
-        log.info("Full GPU mode (%.1f GB VRAM available)", vram_gb)
-    else:
-        # RTX 4090 / smaller — use CPU offload
-        pipe.enable_model_cpu_offload()
-        log.info("CPU offload mode (%.1f GB VRAM available)", vram_gb)
+    # Always use CPU offload — model is too large for even 48GB GPUs during generation
+    pipe.enable_model_cpu_offload()
+    log.info("CPU offload enabled (%.1f GB VRAM available)", vram_gb)
 
     # Enable VAE tiling to reduce peak VRAM during decode
     pipe.vae.enable_tiling()
     log.info("VAE tiling enabled")
 
-    # Try to set optimal attention backend
-    try:
-        pipe.transformer.set_attention_backend("flash_hub")
-        log.info("Flash Attention enabled")
-    except Exception as e:
-        log.info("Flash Attention not available: %s (using default)", e)
+    # Try to set optimal attention backend (requires `kernels` package)
+    for backend in ("flash_hub", "sage_hub"):
+        try:
+            pipe.transformer.set_attention_backend(backend)
+            log.info("Attention backend: %s", backend)
+            break
+        except Exception as e:
+            log.info("Attention backend %s not available: %s", backend, e)
 
     t_load = time.time() - t0
     _pipe = pipe
@@ -174,13 +171,13 @@ def _generate(params):
         image = _Image.open(io.BytesIO(img_bytes)).convert("RGB")
         log.info("Input image: %dx%d (%d bytes)", image.width, image.height, len(img_bytes))
     except Exception as e:
-        return {"error": f"Failed to decode image: {e}"}
+        return {"error": "Failed to decode image: %s" % e}
 
     # Seed
     if seed is None:
         seed = random.randint(0, 2**32 - 1)
 
-    generator = _torch.Generator(device="cuda").manual_seed(seed)
+    generator = _torch.Generator(device="cpu").manual_seed(seed)
 
     with _pipe_lock:
         _gen_count += 1
@@ -191,6 +188,13 @@ def _generate(params):
             gen_id, width, height, num_frames, steps, guidance, seed, prompt[:100],
         )
 
+        # Set guidance scale via guider (NOT a pipe kwarg for HunyuanVideo 1.5)
+        if hasattr(_pipe, 'guider') and _pipe.guider is not None:
+            try:
+                _pipe.guider = _pipe.guider.new(guidance_scale=guidance)
+            except Exception:
+                log.info("Could not update guider guidance_scale, using default")
+
         t0 = time.time()
 
         try:
@@ -200,7 +204,6 @@ def _generate(params):
                 generator=generator,
                 num_frames=num_frames,
                 num_inference_steps=steps,
-                guidance_scale=guidance,
                 width=width,
                 height=height,
             )
@@ -208,19 +211,18 @@ def _generate(params):
         except Exception as e:
             t_gen = time.time() - t0
             log.error("[gen #%d] Failed in %.1fs: %s", gen_id, t_gen, e)
-            return {"error": f"Generation failed: {e}"}
+            return {"error": "Generation failed: %s" % e}
 
         t_gen = time.time() - t0
 
     # Encode video to MP4
     try:
         import imageio
+        import numpy as np
         buf = io.BytesIO()
         writer = imageio.get_writer(buf, format="mp4", fps=fps, codec="libx264",
                                      quality=8, pixelformat="yuv420p")
         for frame in frames:
-            # frames are PIL Images or numpy arrays
-            import numpy as np
             if hasattr(frame, 'numpy'):
                 frame_np = frame.numpy()
             elif isinstance(frame, _Image.Image):
@@ -235,7 +237,7 @@ def _generate(params):
                  len(video_bytes) / 1e6)
     except Exception as e:
         log.error("[gen #%d] Video encoding failed: %s", gen_id, e)
-        return {"error": f"Video encoding failed: {e}"}
+        return {"error": "Video encoding failed: %s" % e}
 
     log.info("[gen #%d] Done in %.1fs (%d frames)", gen_id, t_gen, num_frames)
 
@@ -269,8 +271,12 @@ def handler(job):
 
 if __name__ == "__main__":
     log.info("Initializing HunyuanVideo 1.5 i2v worker (CUDA)...")
-    MODEL_PATH = _resolve_model_path()
-    log.info("Using model path: %s", MODEL_PATH)
-    _load_pipeline()
-    log.info("Starting RunPod serverless worker...")
-    runpod.serverless.start({"handler": handler})
+    try:
+        MODEL_PATH = _resolve_model_path()
+        log.info("Using model path: %s", MODEL_PATH)
+        _load_pipeline()
+        log.info("Starting RunPod serverless worker...")
+        runpod.serverless.start({"handler": handler})
+    except Exception as e:
+        log.error("FATAL: Startup failed: %s", e, exc_info=True)
+        sys.exit(1)
