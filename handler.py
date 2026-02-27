@@ -52,7 +52,43 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
-MODEL_PATH = "/models/hunyuan-1.5-i2v"
+# Model paths — check network volume first, then local
+_VOLUME_MODEL_PATH = "/runpod-volume/hunyuan-1.5-i2v"
+_LOCAL_MODEL_PATH = "/models/hunyuan-1.5-i2v"
+
+
+def _resolve_model_path():
+    """Find model weights: network volume > local > download from HuggingFace."""
+    # Check network volume (preferred — pre-loaded, instant)
+    if os.path.exists(os.path.join(_VOLUME_MODEL_PATH, "model_index.json")):
+        log.info("Models found on network volume: %s", _VOLUME_MODEL_PATH)
+        return _VOLUME_MODEL_PATH
+
+    # Check local path (from baked Docker image)
+    if os.path.exists(os.path.join(_LOCAL_MODEL_PATH, "model_index.json")):
+        log.info("Models found locally: %s", _LOCAL_MODEL_PATH)
+        return _LOCAL_MODEL_PATH
+
+    # Last resort: download from HuggingFace (slow — ~54GB)
+    log.warning("No pre-loaded models found. Downloading from HuggingFace (~54GB)...")
+    try:
+        from huggingface_hub import snapshot_download
+        target = _VOLUME_MODEL_PATH if os.path.exists("/runpod-volume") else _LOCAL_MODEL_PATH
+        t0 = time.time()
+        snapshot_download(
+            "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_i2v",
+            local_dir=target,
+            local_dir_use_symlinks=False,
+            ignore_patterns=["*.md", "*.txt", ".gitattributes"],
+        )
+        log.info("Model download complete in %.0fs -> %s", time.time() - t0, target)
+        return target
+    except Exception as e:
+        log.error("Failed to download models: %s", e)
+        return _LOCAL_MODEL_PATH
+
+
+MODEL_PATH = None  # Set at startup
 
 # ── Global pipeline state ────────────────────────────────────────────
 _pipe = None
@@ -233,6 +269,8 @@ def handler(job):
 
 if __name__ == "__main__":
     log.info("Initializing HunyuanVideo 1.5 i2v worker (CUDA)...")
+    MODEL_PATH = _resolve_model_path()
+    log.info("Using model path: %s", MODEL_PATH)
     _load_pipeline()
     log.info("Starting RunPod serverless worker...")
     runpod.serverless.start({"handler": handler})

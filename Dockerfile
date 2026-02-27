@@ -2,6 +2,7 @@
 # Pure Diffusers pipeline — same pattern as agntc-labs/sdxl-worker
 #
 # Model: HunyuanVideo-1.5-Diffusers-720p_i2v (~54GB, FP16 transformer)
+# Models loaded from RunPod network volume at /runpod-volume/hunyuan-1.5-i2v
 # GPU target: AMPERE_48 (A6000, 48GB VRAM) — FP16 fits without offloading
 # Fallback: ADA_24 (RTX 4090, 24GB) — with CPU offload + VAE tiling
 
@@ -18,31 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Download models from HuggingFace (~54GB) ─────────────────────────
-# Pre-baked into image so cold start doesn't download 54GB
-RUN python3 -c "
-from huggingface_hub import snapshot_download
-import os
-
-print('Downloading HunyuanVideo 1.5 720p i2v (Diffusers format)...')
-snapshot_download(
-    'hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_i2v',
-    local_dir='/models/hunyuan-1.5-i2v',
-    local_dir_use_symlinks=False,
-    ignore_patterns=['*.md', '*.txt', '.gitattributes'],
-)
-print('Model download complete.')
-
-# Verify
-for root, dirs, files in os.walk('/models/hunyuan-1.5-i2v'):
-    for f in files:
-        fpath = os.path.join(root, f)
-        sz = os.path.getsize(fpath)
-        if sz > 100_000_000:  # >100MB
-            print(f'  {fpath}: {sz / 1e9:.1f} GB')
-"
-
-# ── Copy handler ─────────────────────────────────────────────────────
+# ── Copy handler + download script ──────────────────────────────────
 COPY handler.py .
+COPY download_models.py .
 
 CMD ["python3", "-u", "handler.py"]
