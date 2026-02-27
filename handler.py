@@ -160,11 +160,11 @@ def _generate(params):
     prompt = params.get("prompt", "gentle natural movement, subtle animation")
     image_b64 = params.get("image_b64", "")
     num_frames = params.get("num_frames", 121)
-    steps = params.get("num_inference_steps", 30)
+    steps = params.get("num_inference_steps", 20)
     guidance = params.get("guidance_scale", 6.0)
     seed = params.get("seed")
-    width = params.get("width", 1280)
-    height = params.get("height", 720)
+    width = params.get("width", 864)
+    height = params.get("height", 480)
     fps = params.get("fps", 24)
 
     if not image_b64:
